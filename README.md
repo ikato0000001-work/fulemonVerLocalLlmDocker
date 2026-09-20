@@ -1,0 +1,2 @@
+# fulemonVerLocalLlmDocker
+Ful衛門VerローカルLLM　Docker
