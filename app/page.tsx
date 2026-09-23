@@ -1,28 +1,20 @@
 'use client';
 
-import React, { useState, useCallback, useEffect, useRef } from 'react';
+import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import Image from 'next/image';
-
-const AVAILABLE_MODELS = [
-  { id: 'gemma4:e2b', name: 'Gemma4 2B (軽量)' },
-  { id: 'gemma4:e4b', name: 'Gemma4 4B (高性能)' },
-];
-
-type MessageRole = 'user' | 'assistant' | 'system';
-
-interface Message {
-  role: MessageRole;
-  content: string;
-  displayContent?: string;
-  images?: string[];
-}
-
-type AttachedFile = {
-  id: string;
-  name: string;
-  kind: 'text' | 'image';
-  content: string;
-};
+import { Message, AttachedFile, AgentMode, CodeFile } from '@/types/chat';
+import {
+  AVAILABLE_MODELS,
+  GENERAL_SYSTEM_PROMPT,
+  CODING_AGENT_SYSTEM_PROMPT,
+  ANSWER_SEPARATOR,
+  GENERAL_ANSWER_CLOSING,
+  CODING_ANSWER_CLOSING,
+  QuickAction,
+} from '@/lib/prompts';
+import { extractCodeFiles } from '@/lib/codeExtractor';
+import QuickActions from '@/components/QuickActions';
+import CodingWorkspace from '@/components/CodingWorkspace';
 
 const MAX_ATTACHMENTS = 5;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
@@ -43,15 +35,7 @@ const TEXT_EXTENSIONS = new Set([
   'dockerfile', 'gitignore',
 ]);
 
-const SYSTEM_PROMPT: Message = {
-  role: 'system',
-  content:
-    'あなたは非常に優秀なIT専門家です。ユーザーの質問に対して、丁寧で分かりやすい日本語で回答してください。挨拶や自己紹介は一切行わず、質問への回答のみを簡潔に、直接的にお出しください。',
-};
-
 const DEFAULT_TOPIC_NAME = '新しいチャット';
-const ANSWER_SEPARATOR = 'ーーーーーーーーーーーーーーーーーーーーーーーーーーーーー';
-const ANSWER_CLOSING = '回答ここまででござる';
 
 const getFileExtension = (fileName: string) => {
   const lastDot = fileName.lastIndexOf('.');
@@ -177,21 +161,45 @@ const readDocumentAsText = async (file: File) => {
 
 export default function ChatApp() {
   const [chatHistory, setChatHistory] = useState<Record<string, Message[]>>({
-    [DEFAULT_TOPIC_NAME]: [SYSTEM_PROMPT],
+    [DEFAULT_TOPIC_NAME]: [GENERAL_SYSTEM_PROMPT],
+  });
+
+  const [topicModes, setTopicModes] = useState<Record<string, AgentMode>>({
+    [DEFAULT_TOPIC_NAME]: 'general',
   });
 
   const [input, setInput] = useState('');
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
   const [fileError, setFileError] = useState('');
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
-  const [selectedModel, setSelectedModel] = useState<string>(AVAILABLE_MODELS[1].id);
+  const [selectedModel, setSelectedModel] = useState<string>(AVAILABLE_MODELS[0].id);
   const [isLoading, setIsLoading] = useState(false);
   const [currentTopic, setCurrentTopic] = useState<string>(DEFAULT_TOPIC_NAME);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isWorkspaceOpen, setIsWorkspaceOpen] = useState(true);
   const [copiedMessageIndex, setCopiedMessageIndex] = useState<number | null>(null);
+
+  // ワークスペース内の編集されたファイル状態のオーバーライド
+  const [workspaceOverrides, setWorkspaceOverrides] = useState<Record<string, string>>({});
+
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
+  const currentMode: AgentMode = topicModes[currentTopic] || 'general';
+  const selectableModels = currentMode === 'coding'
+    ? AVAILABLE_MODELS.filter((model) => model.isCodingSpecialized)
+    : AVAILABLE_MODELS;
+  
+  useEffect(() => {
+    if (currentMode !== 'coding' || selectableModels.some((model) => model.id === selectedModel)) {
+      return;
+    }
+  
+    setSelectedModel(selectableModels[0]?.id ?? AVAILABLE_MODELS[0].id);
+  }, [currentMode, selectableModels, selectedModel]);
+
+  // 履歴の初期ロード
   useEffect(() => {
     if (typeof window === 'undefined') {
       return;
@@ -199,23 +207,59 @@ export default function ChatApp() {
 
     try {
       const savedHistory = window.localStorage.getItem('ai-chat-history');
-      if (!savedHistory) {
-        return;
+      const savedModes = window.localStorage.getItem('ai-chat-modes');
+
+      let parsedHistory: Record<string, Message[]> = {
+        [DEFAULT_TOPIC_NAME]: [GENERAL_SYSTEM_PROMPT],
+      };
+
+      if (savedHistory) {
+        parsedHistory = JSON.parse(savedHistory) as Record<string, Message[]>;
       }
 
-      const parsedHistory = JSON.parse(savedHistory) as Record<string, Message[]>;
-      const fallbackTopic = Object.keys(parsedHistory)[0] ?? DEFAULT_TOPIC_NAME;
+      let parsedModes: Record<string, AgentMode> = {
+        [DEFAULT_TOPIC_NAME]: 'general',
+      };
+
+      if (savedModes) {
+        parsedModes = JSON.parse(savedModes) as Record<string, AgentMode>;
+      }
+
+      // 「起動時は新規の会話状態で起動」: 未送信の空トピックを探すか、無ければ作成
+      const existingTopics = Object.keys(parsedHistory);
+      const emptyTopic = existingTopics.find((topic) => {
+        const msgs = parsedHistory[topic];
+        return Array.isArray(msgs) && (msgs.length === 0 || (msgs.length === 1 && msgs[0]?.role === 'system'));
+      });
+
+      let initialTopic: string;
+      if (emptyTopic) {
+        initialTopic = emptyTopic;
+      } else {
+        let topicNumber = 1;
+        let nextTopic = DEFAULT_TOPIC_NAME;
+        while (existingTopics.includes(nextTopic)) {
+          topicNumber += 1;
+          nextTopic = `新しいチャット ${topicNumber}`;
+        }
+        initialTopic = nextTopic;
+        parsedHistory[initialTopic] = [GENERAL_SYSTEM_PROMPT];
+        parsedModes[initialTopic] = 'general';
+      }
 
       setChatHistory(parsedHistory);
-      setCurrentTopic(fallbackTopic);
+      setTopicModes(parsedModes);
+      setCurrentTopic(initialTopic);
+
     } catch (error) {
       console.error('履歴の読み込み中にエラーが発生しました:', error);
-      setChatHistory({ [DEFAULT_TOPIC_NAME]: [SYSTEM_PROMPT] });
+      setChatHistory({ [DEFAULT_TOPIC_NAME]: [GENERAL_SYSTEM_PROMPT] });
+      setTopicModes({ [DEFAULT_TOPIC_NAME]: 'general' });
       setCurrentTopic(DEFAULT_TOPIC_NAME);
     }
   }, []);
 
-  const saveHistory = useCallback((history: Record<string, Message[]>) => {
+  const saveHistory = useCallback((history: Record<string, Message[]>, modes?: Record<string, AgentMode>) => {
     if (typeof window !== 'undefined') {
       const historyWithoutImages = Object.fromEntries(
         Object.entries(history).map(([topic, messages]) => [
@@ -224,18 +268,61 @@ export default function ChatApp() {
         ]),
       );
       window.localStorage.setItem('ai-chat-history', JSON.stringify(historyWithoutImages));
+
+      if (modes) {
+        window.localStorage.setItem('ai-chat-modes', JSON.stringify(modes));
+      }
     }
+  }, []);
+
+  const getTopicSystemPrompt = useCallback((mode: AgentMode): Message => {
+    return mode === 'coding' ? CODING_AGENT_SYSTEM_PROMPT : GENERAL_SYSTEM_PROMPT;
   }, []);
 
   const getTopicMessages = useCallback(
     (topicName: string): Message[] => {
       const topicMessages = chatHistory[topicName];
-      return Array.isArray(topicMessages) && topicMessages.length >= 0 ? topicMessages : [SYSTEM_PROMPT];
+      const mode = topicModes[topicName] || 'general';
+      const prompt = getTopicSystemPrompt(mode);
+      return Array.isArray(topicMessages) && topicMessages.length >= 0 ? topicMessages : [prompt];
     },
-    [chatHistory],
+    [chatHistory, getTopicSystemPrompt, topicModes],
   );
 
   const currentMessages = getTopicMessages(currentTopic);
+
+  // トピックのメッセージ群から最新のコードファイルを抽出
+  const extractedFiles = useMemo(() => {
+    const assistantMessages = currentMessages.filter((m) => m.role === 'assistant');
+    if (assistantMessages.length === 0) return [];
+
+    // 最新のメッセージから順にコードを抽出し、パスまたは名前で最新版を統合
+    const fileMap = new Map<string, CodeFile>();
+
+    for (let i = assistantMessages.length - 1; i >= 0; i--) {
+      const filesInMsg = extractCodeFiles(assistantMessages[i].content);
+      for (const f of filesInMsg) {
+        if (!fileMap.has(f.path)) {
+          fileMap.set(f.path, f);
+        }
+      }
+    }
+
+    const files = Array.from(fileMap.values());
+
+    // ユーザーによる編集オーバーライドを適用
+    return files.map((f) => ({
+      ...f,
+      content: workspaceOverrides[f.id] !== undefined ? workspaceOverrides[f.id] : f.content,
+    }));
+  }, [currentMessages, workspaceOverrides]);
+
+  const handleUpdateWorkspaceFile = useCallback((fileId: string, updatedContent: string) => {
+    setWorkspaceOverrides((prev) => ({
+      ...prev,
+      [fileId]: updatedContent,
+    }));
+  }, []);
 
   const addFiles = useCallback(async (fileList: FileList | File[]) => {
     const incoming = Array.from(fileList);
@@ -338,9 +425,17 @@ export default function ChatApp() {
     );
   };
 
+  const makeTopicTitle = (question: string) => {
+    const trimmed = question.trim();
+    if (!trimmed) {
+      return DEFAULT_TOPIC_NAME;
+    }
+    return trimmed.slice(0, 60).trimEnd() || DEFAULT_TOPIC_NAME;
+  };
+
   const handleSend = useCallback(
-    async (e: React.FormEvent<HTMLFormElement>) => {
-      e.preventDefault();
+    async (e?: React.FormEvent<HTMLFormElement>) => {
+      e?.preventDefault();
       if (isLoading) return;
 
       const userMessage = buildUserMessage(input, attachedFiles);
@@ -352,8 +447,16 @@ export default function ChatApp() {
         ? makeTopicTitle(input.trim() || attachedFiles[0]?.name || DEFAULT_TOPIC_NAME)
         : currentTopic;
 
+      // 初回送信時にシステムプロンプトを最新のモードに合わせて確実に設定
+      const systemPromptForSend = getTopicSystemPrompt(currentMode);
+      const preparedHistory = isInitialTopic
+        ? [systemPromptForSend]
+        : historyBeforeSend;
+
       setChatHistory((prev) => {
-        const topicMessages = Array.isArray(prev[activeTopicName]) ? prev[activeTopicName] : [SYSTEM_PROMPT];
+        const topicMessages = isInitialTopic
+          ? [systemPromptForSend]
+          : (Array.isArray(prev[activeTopicName]) ? prev[activeTopicName] : [systemPromptForSend]);
 
         if (isInitialTopic && activeTopicName !== currentTopic) {
           const rest = Object.fromEntries(
@@ -376,6 +479,14 @@ export default function ChatApp() {
       });
 
       if (isInitialTopic) {
+        setTopicModes((prev) => {
+          const nextModes = { ...prev, [activeTopicName]: currentMode };
+          if (activeTopicName !== currentTopic) {
+            delete nextModes[currentTopic];
+          }
+          saveHistory(chatHistory, nextModes);
+          return nextModes;
+        });
         setCurrentTopic(activeTopicName);
       }
 
@@ -391,7 +502,7 @@ export default function ChatApp() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            messages: [...historyBeforeSend, userMessage],
+            messages: [...preparedHistory, userMessage],
             model: selectedModel,
           }),
           signal: abortController.signal,
@@ -416,7 +527,9 @@ export default function ChatApp() {
 
         setChatHistory((prev) => {
           const targetTopic = isInitialTopic ? activeTopicName : currentTopic;
-          const topicMessages = Array.isArray(prev[targetTopic]) ? prev[targetTopic] : [SYSTEM_PROMPT];
+          const topicMessages = Array.isArray(prev[targetTopic])
+            ? prev[targetTopic]
+            : [systemPromptForSend];
           const nextHistory = {
             ...prev,
             [targetTopic]: [...topicMessages, aiMessage],
@@ -424,6 +537,11 @@ export default function ChatApp() {
           saveHistory(nextHistory);
           return nextHistory;
         });
+
+        // コーディングモードかつコードが含まれている場合はワークスペースを開く
+        if (currentMode === 'coding') {
+          setIsWorkspaceOpen(true);
+        }
       } catch (error) {
         if (error instanceof DOMException && error.name === 'AbortError') {
           return;
@@ -432,7 +550,6 @@ export default function ChatApp() {
         console.error('チャット処理エラー:', error);
 
         let errorMessage = '予期せぬエラーが発生しました。アプリを再起動するか、開発者コンソール（F12）を確認してください。';
-
         if (error instanceof Error) {
           errorMessage = `AI応答エラー: ${error.message}`;
         }
@@ -444,7 +561,9 @@ export default function ChatApp() {
 
         setChatHistory((prev) => {
           const targetTopic = isInitialTopic ? activeTopicName : currentTopic;
-          const topicMessages = Array.isArray(prev[targetTopic]) ? prev[targetTopic] : [SYSTEM_PROMPT];
+          const topicMessages = Array.isArray(prev[targetTopic])
+            ? prev[targetTopic]
+            : [systemPromptForSend];
           const nextHistory = {
             ...prev,
             [targetTopic]: [...topicMessages, errorDisplayMessage],
@@ -459,15 +578,72 @@ export default function ChatApp() {
         setIsLoading(false);
       }
     },
-    [attachedFiles, currentTopic, getTopicMessages, input, isLoading, saveHistory, selectedModel],
+    [
+      attachedFiles,
+      chatHistory,
+      currentMode,
+      currentTopic,
+      getTopicMessages,
+      getTopicSystemPrompt,
+      input,
+      isLoading,
+      saveHistory,
+      selectedModel,
+    ],
   );
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      e.preventDefault();
+      void handleSend();
+    }
+  };
+
+  const switchMode = (newMode: AgentMode) => {
+    if (currentMode === newMode) return;
+
+    setTopicModes((prev) => {
+      const nextModes = { ...prev, [currentTopic]: newMode };
+      saveHistory(chatHistory, nextModes);
+      return nextModes;
+    });
+
+    // システムプロンプトを先頭で更新
+    setChatHistory((prev) => {
+      const existing = prev[currentTopic] || [];
+      const updatedPrompt = getTopicSystemPrompt(newMode);
+      let nextMessages: Message[];
+
+      if (existing.length > 0 && existing[0]?.role === 'system') {
+        nextMessages = [updatedPrompt, ...existing.slice(1)];
+      } else {
+        nextMessages = [updatedPrompt, ...existing];
+      }
+
+      const nextHistory = { ...prev, [currentTopic]: nextMessages };
+      saveHistory(nextHistory);
+      return nextHistory;
+    });
+
+    if (newMode === 'coding') {
+      setIsWorkspaceOpen(true);
+    }
+  };
+
+  const handleSelectQuickAction = (action: QuickAction) => {
+    const template = action.promptTemplate();
+    setInput(template);
+    inputRef.current?.focus();
+  };
 
   const getMessageClass = (role: Message['role']) => {
     if (role === 'user') {
       return 'bg-blue-600 text-white self-end rounded-br-none shadow-md';
     }
     if (role === 'assistant') {
-      return 'bg-gray-200 text-gray-800 self-start rounded-tl-none shadow-md';
+      return currentMode === 'coding'
+        ? 'bg-slate-800 text-slate-100 border border-slate-700 self-start rounded-tl-none shadow-lg'
+        : 'bg-gray-200 text-gray-800 self-start rounded-tl-none shadow-md';
     }
     if (role === 'system') {
       return 'bg-indigo-100 text-indigo-800 self-start border-l-4 border-indigo-400 text-xs italic';
@@ -477,12 +653,13 @@ export default function ChatApp() {
 
   const loadTopic = (topicName: string) => {
     const normalizedTopic = topicName.trim();
-    if (!normalizedTopic) {
-      return;
-    }
+    if (!normalizedTopic) return;
+
+    const mode = topicModes[normalizedTopic] || 'general';
+    const prompt = getTopicSystemPrompt(mode);
 
     setChatHistory((prev) => {
-      const existingMessages = Array.isArray(prev[normalizedTopic]) ? prev[normalizedTopic] : [SYSTEM_PROMPT];
+      const existingMessages = Array.isArray(prev[normalizedTopic]) ? prev[normalizedTopic] : [prompt];
       return {
         ...prev,
         [normalizedTopic]: existingMessages,
@@ -492,34 +669,40 @@ export default function ChatApp() {
     setCurrentTopic(normalizedTopic);
   };
 
-  const addNewTopic = () => {
+  const addNewTopic = (mode: AgentMode = currentMode) => {
     const existingTopics = Object.keys(chatHistory);
     let topicNumber = 1;
-    let nextTopic = DEFAULT_TOPIC_NAME;
+    let nextTopic = mode === 'coding' ? '新しいコーディングタスク' : DEFAULT_TOPIC_NAME;
 
     while (existingTopics.includes(nextTopic)) {
       topicNumber += 1;
-      nextTopic = `新しいチャット ${topicNumber}`;
+      nextTopic = mode === 'coding' ? `コーディングタスク ${topicNumber}` : `新しいチャット ${topicNumber}`;
     }
+
+    const newPrompt = getTopicSystemPrompt(mode);
+
+    setTopicModes((prev) => {
+      const nextModes = { ...prev, [nextTopic]: mode };
+      saveHistory(chatHistory, nextModes);
+      return nextModes;
+    });
 
     setChatHistory((prev) => {
       const nextHistory = {
         ...prev,
-        [nextTopic]: [SYSTEM_PROMPT],
+        [nextTopic]: [newPrompt],
       };
       saveHistory(nextHistory);
       return nextHistory;
     });
+
     setCurrentTopic(nextTopic);
-  };
-
-  const makeTopicTitle = (question: string) => {
-    const trimmed = question.trim();
-    if (!trimmed) {
-      return DEFAULT_TOPIC_NAME;
+    setInput('');
+    setAttachedFiles([]);
+    setFileError('');
+    if (mode === 'coding') {
+      setIsWorkspaceOpen(true);
     }
-
-    return trimmed.slice(0, 60).trimEnd() || DEFAULT_TOPIC_NAME;
   };
 
   const deleteMessage = (index: number) => {
@@ -529,11 +712,13 @@ export default function ChatApp() {
 
     const safeMessages = getTopicMessages(currentTopic);
     const newMessages = safeMessages.filter((_, messageIndex) => messageIndex !== index);
+    const mode = topicModes[currentTopic] || 'general';
+    const prompt = getTopicSystemPrompt(mode);
 
     setChatHistory((prev) => {
       const nextHistory = {
         ...prev,
-        [currentTopic]: newMessages.length > 0 ? newMessages : [SYSTEM_PROMPT],
+        [currentTopic]: newMessages.length > 0 ? newMessages : [prompt],
       };
       saveHistory(nextHistory);
       return nextHistory;
@@ -543,7 +728,7 @@ export default function ChatApp() {
   const copyMessage = async (content: string, index: number) => {
     try {
       const copyableContent = content
-        .replace(new RegExp(`\\n\\n${ANSWER_SEPARATOR}\\n*${ANSWER_CLOSING}\\.?$`), '')
+        .replace(new RegExp(`\\n\\n${ANSWER_SEPARATOR}\\n*(${GENERAL_ANSWER_CLOSING}|${CODING_ANSWER_CLOSING})\\.?$`), '')
         .trimEnd();
       await navigator.clipboard.writeText(copyableContent);
       setCopiedMessageIndex(index);
@@ -576,8 +761,9 @@ export default function ChatApp() {
   };
 
   const renderAssistantContent = (content: string, messageIndex: number) => {
+    const isCoding = currentMode === 'coding';
     const displayContent = content
-      .replace(new RegExp(`\\n\\n${ANSWER_SEPARATOR}\\n*${ANSWER_CLOSING}\\.?$`), '')
+      .replace(new RegExp(`\\n\\n${ANSWER_SEPARATOR}\\n*(${GENERAL_ANSWER_CLOSING}|${CODING_ANSWER_CLOSING})\\.?$`), '')
       .trimEnd();
     const sections = displayContent.split(/```([^\n]*)\n?([\s\S]*?)```/g);
     let renderedContent: React.ReactNode;
@@ -592,7 +778,7 @@ export default function ChatApp() {
         if (sectionIndex % 3 === 0) {
           if (sections[sectionIndex]) {
             renderedSections.push(
-              <p key={`text-${sectionIndex}`} className="whitespace-pre-wrap text-sm">
+              <p key={`text-${sectionIndex}`} className="whitespace-pre-wrap text-sm leading-relaxed">
                 {renderAssistantText(sections[sectionIndex], `message-${messageIndex}-${sectionIndex}`)}
               </p>,
             );
@@ -604,22 +790,35 @@ export default function ChatApp() {
           continue;
         }
 
+        const rawHeader = sections[sectionIndex - 1]?.trim() || '';
         const code = sections[sectionIndex].replace(/^\n|\n$/g, '');
         const copyIndex = messageIndex * 1000 + codeBlockIndex;
         codeBlockIndex += 1;
+
         renderedSections.push(
-          <div key={`code-${sectionIndex}`} className="my-3 overflow-hidden rounded-lg bg-gray-900">
-            <div className="flex items-center justify-between border-b border-gray-700 px-3 py-2 text-xs text-gray-300">
-              <span>ソースコード</span>
-              <button
-                type="button"
-                onClick={() => void copyCodeBlock(code, copyIndex)}
-                className="text-gray-300 underline hover:text-white"
-              >
-                {copiedMessageIndex === copyIndex ? 'コピー済み' : 'コードをコピー'}
-              </button>
+          <div key={`code-${sectionIndex}`} className="my-3 overflow-hidden rounded-lg bg-gray-950 border border-gray-800 shadow-md">
+            <div className="flex items-center justify-between border-b border-gray-800 px-3 py-2 text-xs text-gray-300">
+              <div className="flex items-center gap-2 font-mono">
+                <span className="text-indigo-400">📄 {rawHeader || 'コード'}</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setIsWorkspaceOpen(true)}
+                  className="text-indigo-300 hover:text-indigo-100 transition text-[11px] underline"
+                >
+                  ワークスペースで開く
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void copyCodeBlock(code, copyIndex)}
+                  className="px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-200 text-xs transition"
+                >
+                  {copiedMessageIndex === copyIndex ? 'コピー済み' : 'コピー'}
+                </button>
+              </div>
             </div>
-            <pre className="overflow-x-auto p-3 text-xs leading-5 text-gray-100">
+            <pre className="overflow-x-auto p-3 text-xs leading-5 text-gray-100 font-mono">
               <code>{code}</code>
             </pre>
           </div>
@@ -629,14 +828,16 @@ export default function ChatApp() {
       renderedContent = renderedSections;
     }
 
+    const answerClosing = isCoding ? CODING_ANSWER_CLOSING : GENERAL_ANSWER_CLOSING;
+
     return (
       <>
         {renderedContent}
-        <div className="mt-4 flex flex-col items-start gap-1 text-sm">
-          <span>{ANSWER_SEPARATOR}</span>
-          <span className="inline-flex items-center gap-2">
-            <span>{ANSWER_CLOSING}</span>
-            <Image src="/samurai-avatar.svg" alt="Ful衛門" width={24} height={24} className="h-6 w-6" />
+        <div className="mt-4 flex flex-col items-start gap-1 text-sm border-t border-gray-300/30 pt-3">
+          <span className="text-gray-400 text-xs">{ANSWER_SEPARATOR}</span>
+          <span className="inline-flex items-center gap-2 text-xs font-semibold text-gray-600 dark:text-gray-300">
+            <span>{answerClosing}</span>
+            <Image src="/samurai-avatar.svg" alt="Ful衛門" width={20} height={20} className="h-5 w-5" />
           </span>
         </div>
       </>
@@ -645,27 +846,25 @@ export default function ChatApp() {
 
   const renameTopic = (oldTopicName: string) => {
     const nextName = window.prompt('トピック名を入力してください', oldTopicName);
-    if (nextName === null) {
-      return;
-    }
+    if (nextName === null) return;
 
     const trimmedName = nextName.trim();
-    if (!trimmedName) {
-      return;
-    }
+    if (!trimmedName) return;
 
     setChatHistory((prev) => {
-      if (!prev[oldTopicName]) {
-        return prev;
-      }
-
+      if (!prev[oldTopicName]) return prev;
       const { [oldTopicName]: topicMessages, ...rest } = prev;
-      const nextHistory = {
-        ...rest,
-        [trimmedName]: topicMessages,
-      };
+      const nextHistory = { ...rest, [trimmedName]: topicMessages };
       saveHistory(nextHistory);
       return nextHistory;
+    });
+
+    setTopicModes((prev) => {
+      const mode = prev[oldTopicName] || 'general';
+      const { [oldTopicName]: _, ...rest } = prev;
+      const nextModes = { ...rest, [trimmedName]: mode };
+      saveHistory(chatHistory, nextModes);
+      return nextModes;
     });
 
     if (currentTopic === oldTopicName) {
@@ -675,9 +874,7 @@ export default function ChatApp() {
 
   const deleteTopic = (topicName: string) => {
     const confirmMessage = `「${topicName}」を削除しますか？\nこのチャットの履歴は元に戻せません。`;
-    if (!window.confirm(confirmMessage)) {
-      return;
-    }
+    if (!window.confirm(confirmMessage)) return;
 
     setChatHistory((prev) => {
       const rest = Object.fromEntries(
@@ -687,7 +884,7 @@ export default function ChatApp() {
 
       if (Object.keys(nextHistory).length === 0) {
         const fallbackHistory = {
-          [DEFAULT_TOPIC_NAME]: [SYSTEM_PROMPT],
+          [DEFAULT_TOPIC_NAME]: [GENERAL_SYSTEM_PROMPT],
         };
         saveHistory(fallbackHistory);
         setCurrentTopic(DEFAULT_TOPIC_NAME);
@@ -695,7 +892,6 @@ export default function ChatApp() {
       }
 
       saveHistory(nextHistory);
-
       if (currentTopic === topicName) {
         const nextTopic = Object.keys(nextHistory)[0];
         setCurrentTopic(nextTopic);
@@ -703,275 +899,410 @@ export default function ChatApp() {
 
       return nextHistory;
     });
+
+    setTopicModes((prev) => {
+      const nextModes = { ...prev };
+      delete nextModes[topicName];
+      return nextModes;
+    });
   };
 
   return (
-    <div className="flex min-h-screen bg-gray-100">
+    <div className="flex h-screen w-screen overflow-hidden bg-gray-100 font-sans">
+      {/* 左サイドバー: トピック管理 */}
       {isSidebarOpen && (
-        <div className="w-96 bg-white p-6 shadow-xl border-r border-gray-200 flex flex-col">
-          <h2 className="text-xl font-bold mb-6 text-blue-700">📚 チャット履歴</h2>
+        <aside className="w-80 bg-white p-4 shadow-xl border-r border-gray-200 flex flex-col shrink-0 z-10">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-base font-bold text-gray-800 flex items-center gap-2">
+              <span>📚 会話履歴</span>
+            </h2>
+            <button
+              type="button"
+              onClick={() => addNewTopic(currentMode)}
+              className="flex items-center gap-1 rounded-md bg-blue-600 px-2.5 py-1 text-xs font-bold text-white shadow-xs transition hover:bg-blue-700 active:scale-95"
+              title="新規の会話を開始"
+            >
+              <span>＋ 新規</span>
+            </button>
+          </div>
 
+          {/* 新規の会話ボタン（メイン） */}
           <button
             type="button"
-            onClick={addNewTopic}
-            className="mb-4 w-full rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-left text-sm font-semibold text-blue-700 transition hover:bg-blue-100"
+            onClick={() => addNewTopic(currentMode)}
+            className="mb-3 flex w-full items-center justify-center gap-2 rounded-xl border border-blue-200 bg-gradient-to-r from-blue-600 to-indigo-600 px-4 py-2.5 text-sm font-bold text-white shadow-md transition hover:from-blue-700 hover:to-indigo-700 active:scale-[0.99]"
           >
-            ＋ 新しいチャットを追加
+            <span className="text-base">✨</span>
+            <span>新規の会話を開始</span>
           </button>
 
-          <div className="space-y-2 overflow-y-auto overflow-x-hidden h-[calc(100vh-200px)]">
-            {Object.keys(chatHistory).map((topic) => (
-              <div
-                key={topic}
-                className={`flex items-center gap-2 rounded-lg border ${
-                  currentTopic === topic
-                    ? 'border-blue-200 bg-blue-100'
-                    : 'border-transparent bg-transparent'
-                }`}
-              >
-                <button
-                  type="button"
-                  onClick={() => loadTopic(topic)}
-                  className="flex-1 overflow-hidden wrap-break-word text-left p-3 rounded-lg text-sm leading-6 transition duration-150 hover:bg-gray-50"
-                >
-                  {topic === DEFAULT_TOPIC_NAME ? '新規チャット開始' : topic}
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => renameTopic(topic)}
-                  className="group relative flex h-8 w-8 items-center justify-center rounded-md text-sm text-gray-600 transition hover:bg-blue-100 hover:text-blue-700"
-                  aria-label={`${topic} の名前を変更`}
-                  title="名前を編集"
-                >
-                  <span className="text-base">✏️</span>
-                  <span className="pointer-events-none absolute -top-9 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-md bg-slate-800 px-2 py-1 text-[10px] font-medium text-white opacity-0 shadow-lg transition group-hover:opacity-100">
-                    名前を編集
-                  </span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => deleteTopic(topic)}
-                  className="group relative flex h-8 w-8 items-center justify-center rounded-md text-sm text-red-500 transition hover:bg-red-100 hover:text-red-700"
-                  aria-label={`${topic} を削除`}
-                  title="チャットを削除"
-                >
-                  <span className="text-base">🗑️</span>
-                  <span className="pointer-events-none absolute -top-9 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-md bg-red-600 px-2 py-1 text-[10px] font-medium text-white opacity-0 shadow-lg transition group-hover:opacity-100">
-                    チャットを削除
-                  </span>
-                </button>
-              </div>
-            ))}
+          {/* モード別新規作成ボタン */}
+          <div className="grid grid-cols-2 gap-2 mb-4">
+            <button
+              type="button"
+              onClick={() => addNewTopic('general')}
+              className="flex items-center justify-center gap-1.5 rounded-lg border border-blue-200 bg-blue-50 px-2 py-1.5 text-xs font-semibold text-blue-700 transition hover:bg-blue-100 shadow-xs"
+            >
+              <span>💬 通常チャット</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => addNewTopic('coding')}
+              className="flex items-center justify-center gap-1.5 rounded-lg border border-indigo-200 bg-indigo-50 px-2 py-1.5 text-xs font-semibold text-indigo-700 transition hover:bg-indigo-100 shadow-xs"
+            >
+              <span>🛠️ 技師モード</span>
+            </button>
           </div>
-        </div>
+
+          {/* トピックリスト */}
+          <div className="space-y-1.5 overflow-y-auto flex-1 pr-1 scrollbar-thin">
+            {Object.keys(chatHistory).map((topic) => {
+              const mode = topicModes[topic] || 'general';
+              const isSelected = currentTopic === topic;
+              return (
+                <div
+                  key={topic}
+                  className={`group flex items-center gap-1.5 rounded-lg border px-2 py-1.5 text-xs transition ${
+                    isSelected
+                      ? mode === 'coding'
+                        ? 'border-indigo-300 bg-indigo-50/80 font-semibold text-indigo-900 shadow-xs'
+                        : 'border-blue-300 bg-blue-50/80 font-semibold text-blue-900 shadow-xs'
+                      : 'border-transparent text-gray-700 hover:bg-gray-50'
+                  }`}
+                >
+                  <button
+                    type="button"
+                    onClick={() => loadTopic(topic)}
+                    className="flex-1 overflow-hidden text-left truncate flex items-center gap-2 py-1"
+                    title={topic}
+                  >
+                    <span className="text-sm shrink-0">
+                      {mode === 'coding' ? '🛠️' : '💬'}
+                    </span>
+                    <span className="truncate">{topic === DEFAULT_TOPIC_NAME ? '新規チャット開始' : topic}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => renameTopic(topic)}
+                    className="opacity-0 group-hover:opacity-100 p-1 text-gray-400 hover:text-blue-600 transition"
+                    title="名前を編集"
+                  >
+                    ✏️
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => deleteTopic(topic)}
+                    className="opacity-0 group-hover:opacity-100 p-1 text-gray-400 hover:text-red-600 transition"
+                    title="削除"
+                  >
+                    🗑️
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </aside>
       )}
 
-      <div className="flex-1 flex flex-col">
-        <header className="p-4 bg-white border-b border-gray-200 flex justify-between items-center shadow-sm">
+      {/* メインエリア（チャット + ワークスペース） */}
+      <div className="flex-1 flex flex-col h-full overflow-hidden">
+        {/* ヘッダー */}
+        <header className="px-4 py-2.5 bg-white border-b border-gray-200 flex justify-between items-center shadow-xs shrink-0">
           <div className="flex items-center gap-3">
             <button
               type="button"
               onClick={() => setIsSidebarOpen((prev) => !prev)}
-              className="flex h-10 w-10 items-center justify-center rounded-lg border border-gray-200 bg-gray-50 text-xl text-gray-700 transition hover:bg-gray-100"
-              aria-label={isSidebarOpen ? 'チャット履歴を閉じる' : 'チャット履歴を開く'}
-              title={isSidebarOpen ? 'チャット履歴を閉じる' : 'チャット履歴を開く'}
+              className="flex h-9 w-9 items-center justify-center rounded-lg border border-gray-200 bg-gray-50 text-base text-gray-700 transition hover:bg-gray-100"
+              title={isSidebarOpen ? '履歴を閉じる' : '履歴を開く'}
             >
               ☰
             </button>
-            <h1 className="flex items-center gap-2 text-2xl font-extrabold text-blue-700">
-              <Image src="/samurai-avatar.svg" alt="侍姿のFul衛門" width={40} height={40} className="h-10 w-10" />
-              <span>Ful衛門 Ver.ローカルLLM</span>
-            </h1>
+
+            <div className="flex items-center gap-2">
+              <Image src="/samurai-avatar.svg" alt="侍姿のFul衛門" width={32} height={32} className="h-8 w-8" />
+              <div>
+                <h1 className="text-base font-extrabold text-gray-900 leading-none flex items-center gap-2">
+                  <span>Ful衛門</span>
+                  <span className={`text-[11px] font-medium px-2 py-0.5 rounded-full ${
+                    currentMode === 'coding'
+                      ? 'bg-indigo-100 text-indigo-800 border border-indigo-200'
+                      : 'bg-blue-100 text-blue-800 border border-blue-200'
+                  }`}>
+                    {currentMode === 'coding' ? '技師（コーディングエージェント）' : '標準モード'}
+                  </span>
+                </h1>
+              </div>
+            </div>
           </div>
-          <span className="text-sm text-gray-500 font-mono bg-gray-100 px-3 py-1 rounded">
-            トピック: {currentTopic}
-          </span>
+
+          {/* 中央: モード切替タブ */}
+          <div className="flex items-center rounded-lg bg-gray-100 p-1 border border-gray-200 text-xs">
+            <button
+              type="button"
+              onClick={() => switchMode('general')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md font-medium transition ${
+                currentMode === 'general'
+                  ? 'bg-white text-blue-700 shadow-xs'
+                  : 'text-gray-600 hover:text-gray-900'
+              }`}
+            >
+              <span>💬</span>
+              <span>通常チャット</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => switchMode('coding')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md font-medium transition ${
+                currentMode === 'coding'
+                  ? 'bg-indigo-600 text-white shadow-xs'
+                  : 'text-gray-600 hover:text-gray-900'
+              }`}
+            >
+              <span>🛠️</span>
+              <span>技師エージェント</span>
+            </button>
+          </div>
+
+          {/* 右側: モデル選択 & ワークスペース開閉 */}
+          <div className="flex items-center gap-3">
+            {currentMode === 'coding' && (
+              <button
+                type="button"
+                onClick={() => setIsWorkspaceOpen((prev) => !prev)}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-semibold transition ${
+                  isWorkspaceOpen
+                    ? 'border-indigo-500 bg-indigo-50 text-indigo-700'
+                    : 'border-gray-300 bg-white text-gray-700 hover:bg-gray-50'
+                }`}
+                title="コードワークスペースの表示/非表示"
+              >
+                <span>🖥️</span>
+                <span>ワークスペース {extractedFiles.length > 0 && `(${extractedFiles.length})`}</span>
+              </button>
+            )}
+
+            <div className="flex items-center gap-1.5 text-xs text-gray-600">
+              <span className="font-medium">モデル:</span>
+              <select
+                value={selectedModel}
+                onChange={(e) => setSelectedModel(e.target.value)}
+                className="rounded-md border border-gray-300 bg-white px-2.5 py-1 text-xs focus:border-indigo-500 focus:outline-none"
+              >
+                {selectableModels.map((model) => (
+                  <option key={model.id} value={model.id}>
+                    {model.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
         </header>
 
-        <div className="flex-1 overflow-y-auto p-6 bg-white rounded-xl shadow-lg mb-6 border border-gray-200 max-h-[70vh]">
-          {currentMessages.map((msg, index) => {
-            if (msg.role === 'system') {
-              return null;
-            }
+        {/* ワークスペースとチャットの2ペインコンテナ */}
+        <div className="flex-1 flex overflow-hidden">
+          {/* チャットペイン */}
+          <div className="flex-1 flex flex-col h-full overflow-hidden bg-gray-50">
+            {/* メッセージ一覧 */}
+            <div className="flex-1 overflow-y-auto p-4 md:p-6 space-y-4">
+              {currentMessages.map((msg, index) => {
+                if (msg.role === 'system') return null;
 
-            return (
-              <div key={`${msg.role}-${index}`} className={`flex mb-6 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                <div className={`max-w-[85%] p-4 rounded-xl shadow-md ${getMessageClass(msg.role)}`}>
-                  <strong className="text-xs font-medium block mb-1">
-                    {msg.role === 'user' ? (
-                      <span className="inline-flex items-center gap-1.5">
-                        <Image src="/user-avatar.svg" alt="" width={20} height={20} className="h-5 w-5" />
-                        あなた
-                      </span>
-                    ) : (
-                      <span className="inline-flex items-center gap-1.5">
-                        <Image src="/samurai-avatar.svg" alt="" width={20} height={20} className="h-5 w-5" />
-                        Ful衛門
-                      </span>
-                    )}
-                  </strong>
-                  {msg.role === 'user' ? (
-                    <p className="whitespace-pre-wrap text-sm">{getDisplayContent(msg)}</p>
-                  ) : (
-                    renderAssistantContent(msg.content, index)
-                  )}
-                  {msg.role === 'assistant' && (
-                    <div className="mt-2 flex gap-3 text-xs">
-                      <button
-                        type="button"
-                        onClick={() => void copyMessage(msg.content, index)}
-                        className="text-gray-500 underline hover:text-blue-600"
-                      >
-                        {copiedMessageIndex === index ? 'コピー済み' : 'コピー'}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => deleteMessage(index)}
-                        className="text-red-400 underline hover:text-red-600"
-                      >
-                        削除
-                      </button>
+                return (
+                  <div
+                    key={`${msg.role}-${index}`}
+                    className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                  >
+                    <div className={`max-w-[90%] md:max-w-[80%] p-4 rounded-xl shadow-xs ${getMessageClass(msg.role)}`}>
+                      <strong className="text-xs font-medium block mb-1.5">
+                        {msg.role === 'user' ? (
+                          <span className="inline-flex items-center gap-1.5 text-blue-100">
+                            <Image src="/user-avatar.svg" alt="" width={18} height={18} className="h-4 w-4" />
+                            あなた
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1.5 text-indigo-400 font-semibold">
+                            <Image src="/samurai-avatar.svg" alt="" width={18} height={18} className="h-4 w-4" />
+                            {currentMode === 'coding' ? 'Ful衛門 技師' : 'Ful衛門'}
+                          </span>
+                        )}
+                      </strong>
+
+                      {msg.role === 'user' ? (
+                        <p className="whitespace-pre-wrap text-sm">{getDisplayContent(msg)}</p>
+                      ) : (
+                        renderAssistantContent(msg.content, index)
+                      )}
+
+                      {msg.role === 'assistant' && (
+                        <div className="mt-3 flex gap-3 text-xs pt-2 border-t border-gray-400/20">
+                          <button
+                            type="button"
+                            onClick={() => void copyMessage(msg.content, index)}
+                            className="text-gray-400 hover:text-indigo-400 underline transition"
+                          >
+                            {copiedMessageIndex === index ? 'コピー済み' : '全文コピー'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => deleteMessage(index)}
+                            className="text-red-400 hover:text-red-500 underline transition"
+                          >
+                            削除
+                          </button>
+                        </div>
+                      )}
                     </div>
-                  )}
-                </div>
-              </div>
-            );
-          })}
+                  </div>
+                );
+              })}
 
-          {isLoading && (
-            <div className="flex justify-start mb-6">
-              <div className="p-4 bg-gray-200 rounded-xl shadow-md animate-pulse">
-                <strong className="flex items-center gap-1.5 text-sm mb-1">
-                  <Image src="/samurai-avatar.svg" alt="" width={24} height={24} className="h-6 w-6" />
-                  Ful衛門が思考中...
-                </strong>
-              </div>
+              {isLoading && (
+                <div className="flex justify-start">
+                  <div className="p-4 bg-white border border-gray-200 rounded-xl shadow-xs animate-pulse">
+                    <strong className="flex items-center gap-2 text-xs text-indigo-600 font-semibold">
+                      <Image src="/samurai-avatar.svg" alt="" width={20} height={20} className="h-5 w-5" />
+                      {currentMode === 'coding' ? 'Ful衛門 技師がコードを構築中...' : 'Ful衛門が思考中...'}
+                    </strong>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* 下部フォームエリア */}
+            <div className="p-3 bg-white border-t border-gray-200">
+              {/* コーディングモード時のクイックアクションバー */}
+              {currentMode === 'coding' && (
+                <div className="mb-2">
+                  <QuickActions onSelectAction={handleSelectQuickAction} disabled={isLoading} />
+                </div>
+              )}
+
+              <form
+                onSubmit={handleSend}
+                onDragEnter={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  if (!isLoading) setIsDraggingFiles(true);
+                }}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                }}
+                onDragLeave={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  if (e.currentTarget === e.target) setIsDraggingFiles(false);
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setIsDraggingFiles(false);
+                  if (!isLoading) void addFiles(e.dataTransfer.files);
+                }}
+                className={`rounded-xl border p-2 transition ${
+                  isDraggingFiles ? 'border-indigo-500 bg-indigo-50/50' : 'border-gray-300 bg-white'
+                }`}
+              >
+                {attachedFiles.length > 0 && (
+                  <div className="mb-2 flex flex-wrap gap-1.5 px-1">
+                    {attachedFiles.map((file) => (
+                      <span
+                        key={file.id}
+                        className="inline-flex items-center gap-1.5 rounded-full border border-gray-200 bg-gray-100 px-2.5 py-1 text-xs text-gray-700"
+                      >
+                        <span>{file.kind === 'image' ? '🖼️' : '📄'} {file.name}</span>
+                        <button
+                          type="button"
+                          onClick={() => removeAttachedFile(file.id)}
+                          className="font-bold text-gray-400 hover:text-red-600"
+                          aria-label={`${file.name} を削除`}
+                        >
+                          ×
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                {fileError && (
+                  <p className="mb-2 px-1 text-xs text-red-600">{fileError}</p>
+                )}
+
+                <div className="flex gap-2 items-start">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    multiple
+                    accept={FILE_INPUT_ACCEPT}
+                    className="hidden"
+                    onChange={(e) => {
+                      if (e.target.files) {
+                        void addFiles(e.target.files);
+                      }
+                      e.target.value = '';
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isLoading}
+                    className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-gray-300 bg-gray-50 text-xl text-gray-600 transition hover:bg-gray-100 disabled:bg-gray-50 mt-1"
+                    title="ファイルを添付（ソースコード、文書、画像）"
+                  >
+                    ＋
+                  </button>
+                  <div className="flex-1 flex flex-col gap-1">
+                    <textarea
+                      ref={inputRef}
+                      rows={5}
+                      value={input}
+                      onChange={(e) => setInput(e.target.value)}
+                      onKeyDown={handleKeyDown}
+                      placeholder={
+                        currentMode === 'coding'
+                          ? 'コーディングタスク・要件を入力、またはファイルを添付... (Enterで改行、Ctrl+Enterで送信)'
+                          : '質問を入力、またはファイルを添付... (Enterで改行、Ctrl+Enterで送信)'
+                      }
+                      disabled={isLoading}
+                      className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none disabled:bg-gray-50 text-sm leading-relaxed resize-y font-sans"
+                    />
+                    <div className="flex justify-between items-center px-1 text-[11px] text-gray-400">
+                      <span>💡 Enter: 改行 / Ctrl+Enter: 送信</span>
+                      <span>{input.length} 文字</span>
+                    </div>
+                  </div>
+                  <button
+                    type={isLoading ? 'button' : 'submit'}
+                    onClick={isLoading ? () => abortControllerRef.current?.abort() : undefined}
+                    disabled={!isLoading && (!input.trim() && attachedFiles.length === 0)}
+                    className={`h-11 px-6 rounded-lg transition font-semibold text-sm shadow-xs shrink-0 mt-1 ${
+                      isLoading
+                        ? 'bg-red-600 text-white hover:bg-red-700'
+                        : currentMode === 'coding'
+                        ? 'bg-indigo-600 text-white hover:bg-indigo-700 disabled:bg-gray-400'
+                        : 'bg-blue-600 text-white hover:bg-blue-700 disabled:bg-gray-400'
+                    }`}
+                  >
+                    {isLoading ? '中断' : '送信'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+
+          {/* 右ペイン: コーディングエージェント・ワークスペース */}
+          {currentMode === 'coding' && isWorkspaceOpen && (
+            <div className="w-1/2 min-w-[380px] max-w-[65%] h-full flex flex-col shrink-0">
+              <CodingWorkspace
+                files={extractedFiles}
+                onUpdateFile={handleUpdateWorkspaceFile}
+                onClose={() => setIsWorkspaceOpen(false)}
+              />
             </div>
           )}
         </div>
-
-        <form
-          onSubmit={handleSend}
-          onDragEnter={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            if (!isLoading) {
-              setIsDraggingFiles(true);
-            }
-          }}
-          onDragOver={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-          }}
-          onDragLeave={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            if (e.currentTarget === e.target) {
-              setIsDraggingFiles(false);
-            }
-          }}
-          onDrop={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            setIsDraggingFiles(false);
-            if (!isLoading) {
-              void addFiles(e.dataTransfer.files);
-            }
-          }}
-          className={`p-2 bg-white rounded-xl shadow-lg border ${
-            isDraggingFiles ? 'border-blue-400 bg-blue-50' : 'border-gray-200'
-          }`}
-        >
-          {attachedFiles.length > 0 && (
-            <div className="mb-2 flex flex-wrap gap-2 px-1">
-              {attachedFiles.map((file) => (
-                <span
-                  key={file.id}
-                  className="inline-flex items-center gap-2 rounded-full border border-gray-200 bg-gray-50 px-3 py-1 text-xs text-gray-700"
-                >
-                  <span>{file.kind === 'image' ? '🖼️' : '📄'} {file.name}</span>
-                  <button
-                    type="button"
-                    onClick={() => removeAttachedFile(file.id)}
-                    className="font-bold text-gray-400 hover:text-red-600"
-                    aria-label={`${file.name} を削除`}
-                  >
-                    ×
-                  </button>
-                </span>
-              ))}
-            </div>
-          )}
-
-          {fileError && (
-            <p className="mb-2 px-1 text-xs text-red-600">{fileError}</p>
-          )}
-
-          <div className="flex gap-3">
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              accept={FILE_INPUT_ACCEPT}
-              className="hidden"
-              onChange={(e) => {
-                if (e.target.files) {
-                  void addFiles(e.target.files);
-                }
-                e.target.value = '';
-              }}
-            />
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={isLoading}
-              className="flex items-center justify-center rounded-lg border border-gray-300 bg-gray-50 px-4 py-4 text-xl text-gray-700 transition hover:bg-gray-100 disabled:bg-gray-50"
-              aria-label="ファイルを添付"
-              title="ファイルを添付"
-            >
-              ＋
-            </button>
-            <input
-              type="text"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder={isDraggingFiles ? 'ここにファイルをドロップ...' : '質問を入力、またはファイルを添付...'}
-              disabled={isLoading}
-              className="flex-1 p-4 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500 outline-none disabled:bg-gray-50 text-base"
-            />
-            <button
-              type={isLoading ? 'button' : 'submit'}
-              onClick={isLoading ? () => abortControllerRef.current?.abort() : undefined}
-              disabled={!isLoading && (!input.trim() && attachedFiles.length === 0)}
-              className={`px-8 py-4 rounded-lg transition font-semibold shadow-md hover:shadow-lg ${
-                isLoading
-                  ? 'bg-red-600 text-white hover:bg-red-700'
-                  : 'bg-blue-600 text-white hover:bg-blue-700 disabled:bg-gray-400'
-              }`}
-              aria-label={isLoading ? '質問を中断' : '質問を送信'}
-            >
-              {isLoading ? '中断' : '送信'}
-            </button>
-          </div>
-
-          <div className="mt-3 flex items-center justify-end gap-2 text-sm text-gray-700">
-            <label htmlFor="model-select" className="font-medium">AIモデル</label>
-            <select
-              id="model-select"
-              value={selectedModel}
-              onChange={(e) => setSelectedModel(e.target.value)}
-              className="rounded-md border border-gray-300 bg-white px-3 py-2 focus:border-blue-500 focus:outline-none"
-            >
-              {AVAILABLE_MODELS.map((model) => (
-                <option key={model.id} value={model.id}>
-                  {model.name}
-                </option>
-              ))}
-            </select>
-          </div>
-        </form>
       </div>
     </div>
   );
